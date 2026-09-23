@@ -1,0 +1,11 @@
+[project]
+name = "comfyui-dopeaio"
+description = "All-in-one loader: diffusion model/checkpoint, single/dual CLIP, VAE, unlimited LoRAs with Civitai thumbnails, pos/neg encode, model-aware latent, and a Grok (xAI) prompt builder for Krea 2, MiniMax H3, Flux and Z-Image."
+version = "1.0.0"
+license = { text = "MIT" }
+dependencies = ["requests"]
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "DOPE All-In-One Loader (Grok)"
+Icon = ""
