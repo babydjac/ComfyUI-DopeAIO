@@ -413,6 +413,9 @@ class DopeAIOLoader:
         pos_text, neg_text = positive or "", negative or ""
         grok_note, grok_text = "", ""
         if grok_auto and ((grok_idea or "").strip() or grok_image is not None):
+            if not str(grok_model).startswith("grok"):
+                log.warning("DopeAIO: grok_model '%s' is not an xAI model (shifted workflow values?) — using %s", grok_model, grok.DEFAULT_MODEL)
+                grok_model = grok.DEFAULT_MODEL
             params = dict(idea=grok_idea, style=grok_style, model=grok_model, effort=grok_effort, detail=grok_detail,
                           extra_instructions=grok_instructions, seed=grok_seed or None,
                           want_negative=bool(negative_enabled), lora_triggers=triggers,

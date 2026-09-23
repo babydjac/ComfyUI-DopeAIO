@@ -935,6 +935,32 @@ function moveWidget(node, widget, afterName) {
   ws.splice(at + 1, 0, widget);
 }
 
+function valueFits(w, v) {
+  if (v === null || v === undefined) return false;
+  if (w.type === "combo") return (w.options?.values ?? []).includes(v) || (w.name === "grok_model" && /^grok/.test(v));
+  if (w.type === "toggle") return typeof v === "boolean";
+  if (w.type === "number") return typeof v === "number";
+  if (w.type === "text" || w.type === "customtext") return typeof v === "string";
+  return true;
+}
+
+function restoreValues(node, info) {
+  const byName = info?.properties?.dope_values ?? info?.widgets_values_named;
+  const ws = node.widgets.filter((w) => w.serialize !== false);
+  if (byName) {
+    for (const w of ws) if (w.name in byName) w.value = byName[w.name];
+    return;
+  }
+  // older files: pick whichever layout (holes vs packed) fits the widgets
+  const vals = info?.widgets_values;
+  if (!Array.isArray(vals)) return;
+  const indexed = ws.map((w) => vals[node.widgets.indexOf(w)]);
+  const packed = ws.map((_, i) => vals[i]);
+  const score = (cand) => ws.reduce((n, w, i) => n + valueFits(w, cand[i]), 0);
+  const best = score(indexed) > score(packed) ? indexed : packed;
+  ws.forEach((w, i) => { if (best[i] !== undefined && best[i] !== null) w.value = best[i]; });
+}
+
 // ------------------------------------------------------------------ extension
 app.registerExtension({
   name: EXT,
@@ -1036,9 +1062,22 @@ app.registerExtension({
       return r;
     };
 
+    // The frontend saves widgets_values indexed over *all* widgets (null holes for our
+    // serialize:false buttons/DOM widgets) but loads them packed, which shifts every value
+    // after the first hole. Keep a by-name copy and restore from that.
+    const onSerialize = nodeType.prototype.onSerialize;
+    nodeType.prototype.onSerialize = function (o) {
+      const r = onSerialize?.apply(this, arguments);
+      o.properties = o.properties || {};
+      o.properties.dope_values = Object.fromEntries(
+        this.widgets.filter((w) => w.serialize !== false).map((w) => [w.name, w.value]));
+      return r;
+    };
+
     const onConfigure = nodeType.prototype.onConfigure;
-    nodeType.prototype.onConfigure = function () {
+    nodeType.prototype.onConfigure = function (info) {
       const r = onConfigure?.apply(this, arguments);
+      restoreValues(this, info);
       requestAnimationFrame(() => {
         updateVisibility(this, false);
         for (const name of ["grok_style", "grok_nsfw"]) {
