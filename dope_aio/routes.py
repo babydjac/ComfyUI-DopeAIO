@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from aiohttp import web
 
@@ -15,12 +16,26 @@ log = logging.getLogger("DopeAIO")
 routes = PromptServer.instance.routes
 
 
+# Civitai lookups (hashing, network) get their own small pool so a folder full of LoRAs
+# can never starve Grok requests or ComfyUI's default executor.
+_CIVITAI_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dope-civitai")
+
+
 def _run(fn, *args, **kwargs):
     return asyncio.get_running_loop().run_in_executor(None, lambda: fn(*args, **kwargs))
 
 
+def _run_civ(fn, *args, **kwargs):
+    return asyncio.get_running_loop().run_in_executor(_CIVITAI_POOL, lambda: fn(*args, **kwargs))
+
+
 def _err(e, status=500):
     return web.json_response({"ok": False, "error": str(e)}, status=status)
+
+
+def _read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
 
 
 def _sniff(data):
@@ -70,9 +85,15 @@ async def set_keys(request):
     if kind == "xai":
         grok._models_cache.update(t=0.0, models=None)
     result = {"ok": True, "set": bool(key)}
+    env = store.env_override(kind)
+    if key and env:
+        result["warning"] = f"{env} is set in ComfyUI's environment and takes priority over the key you just saved."
     if kind == "xai" and key and body.get("test", True):
         try:
-            result["test"] = await _run(grok.test_key)
+            test = await _run(grok.test_key)
+            result["test"] = test
+            if test.get("blocked"):
+                result["test_error"] = "xAI says this key is blocked or disabled (check console.x.ai billing/team status)."
         except Exception as e:
             result["test_error"] = str(e)
     return web.json_response(result)
@@ -88,7 +109,7 @@ async def grok_generate(request):
         triggers = []
         if b.get("lora_triggers"):
             for name in b.get("loras") or []:
-                triggers += await _run(civitai.trigger_words, name)
+                triggers += await _run_civ(civitai.trigger_words, name)
         res = await _run(
             grok.generate,
             b.get("idea", ""), b.get("style", STYLE_LABELS[0]),
@@ -100,6 +121,7 @@ async def grok_generate(request):
             lora_triggers=triggers,
             width=int(b.get("width") or 1024), height=int(b.get("height") or 1024),
             length=int(b.get("length") or 124), detail=b.get("detail", "standard"),
+            nsfw=b.get("nsfw", True) is not False,
         )
         return web.json_response({"ok": True, **res})
     except grok.GrokError as e:
@@ -114,7 +136,7 @@ async def grok_generate(request):
 async def list_loras(request):
     names = folder_paths.get_filename_list("loras")
     if request.query.get("previews") == "1":
-        flags = await _run(lambda: {n: bool(civitai.find_local_preview(civitai.lora_path(n) or "")) for n in names})
+        flags = await _run_civ(lambda: {n: bool(civitai.find_local_preview(civitai.lora_path(n) or "")) for n in names})
     else:
         flags = {}
     return web.json_response({"ok": True, "loras": names, "local_previews": flags})
@@ -126,7 +148,7 @@ async def lora_info(request):
     fetch = request.query.get("fetch", "1") == "1"
     refresh = request.query.get("refresh") == "1"
     try:
-        info = await _run(civitai.get_info, name, fetch, refresh)
+        info = await _run_civ(civitai.get_info, name, fetch, refresh)
         return web.json_response({"ok": True, **info})
     except FileNotFoundError:
         return _err(f"lora not found: {name}", 404)
@@ -141,7 +163,7 @@ async def lora_thumb(request):
     fetch = request.query.get("fetch", "1") == "1"
     level = civitai.NSFW_LEVELS.get(request.query.get("nsfw", "PG13").upper().replace("-", ""), 2)
     try:
-        kind, payload, blurred = await _run(civitai.get_thumb, name, fetch, level)
+        kind, payload, blurred = await _run_civ(civitai.get_thumb, name, fetch, level)
     except FileNotFoundError:
         kind, payload, blurred = None, None, False
     except Exception as e:
@@ -149,9 +171,50 @@ async def lora_thumb(request):
         kind, payload, blurred = None, None, False
     headers = {"Cache-Control": "private, max-age=600", "X-Dope-Blurred": "1" if blurred else "0"}
     if kind == "file":
-        with open(payload, "rb") as f:
-            data = f.read()
+        try:
+            data = await _run_civ(_read_bytes, payload)
+        except OSError:
+            return web.Response(status=404, headers={"Cache-Control": "no-store"})
         return web.Response(body=data, content_type=_sniff(data), headers=headers)
     if kind == "bytes":
         return web.Response(body=payload, content_type=_sniff(payload), headers=headers)
     return web.Response(status=404, headers={"Cache-Control": "no-store"})
+
+
+@routes.get("/dope_aio/civitai/search")
+async def civitai_search(request):
+    try:
+        data = await _run_civ(
+            civitai.search_loras,
+            request.query.get("q", ""),
+            request.query.getall("base", []),
+            request.query.get("sort", "Most Downloaded"),
+            request.query.get("nsfw", "1") != "0",
+            request.query.get("cursor") or None,
+        )
+        return web.json_response({"ok": True, **data})
+    except Exception as e:
+        log.warning("DopeAIO civitai search failed: %s", e)
+        return _err(e, 502)
+
+
+@routes.post("/dope_aio/civitai/download")
+async def civitai_download(request):
+    try:
+        body = await request.json()
+    except Exception as e:
+        return _err(e, 400)
+    try:
+        job = await _run_civ(civitai.start_download, body.get("version_id"),
+                             body.get("filename") or "lora.safetensors", body.get("sha256"))
+        return web.json_response({"ok": True, "job": job})
+    except Exception as e:
+        return _err(e, 400)
+
+
+@routes.get("/dope_aio/civitai/download/{job}")
+async def civitai_download_status(request):
+    job = civitai.download_status(request.match_info["job"])
+    if not job:
+        return _err("unknown download", 404)
+    return web.json_response({"ok": True, **job})

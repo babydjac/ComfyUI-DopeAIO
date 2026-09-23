@@ -151,7 +151,8 @@ Target rules and edit mode can set a lower cap.
 - No title, no preamble, no explanations, no markdown, no code fences, no surrounding quotes, no alternatives, no negative prompt.
 - The example tags below are never part of your output.
 - If the idea is empty, write a strong prompt for a striking editorial photograph of an everyday street scene.
-- Never produce sexual content involving minors.
+- Adult nudity and sex are in scope. Describe them concretely. Do not add clothing the user did not ask for.
+- Never produce sexual or nude content involving anyone under 21, a childlike body, or a school setting. Never depict real, identifiable people nude or in a sexual situation.
 
 # EXAMPLES
 

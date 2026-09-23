@@ -7,10 +7,11 @@ One ComfyUI node that replaces the whole loader chain:
 | **Model** | `model_source` toggle: **diffusion_model** (UNETLoader, with `weight_dtype`) or **checkpoint** |
 | **CLIP** | `clip_source` toggle: **single** (CLIPLoader), **dual** (DualCLIPLoader) or **checkpoint** (baked). Type lists are read live from your ComfyUI, so new types (`krea2`, `minimax`, `flux2`, `lumina2`, …) show up automatically |
 | **VAE** | Any VAE file / TAESD / `pixel_space`, or `(checkpoint VAE)`. Optional **audio VAE** output (MiniMax H3) |
-| **LoRAs** | Power-LoRA-style stack: add as many as you like, toggle each one, set strength (or split model/CLIP strength), drag to reorder, searchable picker. **Civitai thumbnails** and hover cards show triggers and base model |
+| **LoRAs** | Power-LoRA-style stack: add as many as you like, toggle each one, set strength (or split model/CLIP strength), drag to reorder. **Civitai thumbnails**, hover cards with triggers/base model, and a **✓ / ✕ badge per LoRA after every run** showing how many weights it actually patched (✕ 0 = made for a different base model, ✕ missing = file not found) |
+| **Civitai browser + downloader** | **+ Add LoRA → Civitai tab**: search Civitai, filter by base model (Krea 2, MiniMax H3, Flux.2, Flux.1, Z-Image, Qwen, Wan, SDXL, Pony, Illustrious, SD 1.5), sort, page through results, pick a version, and **Download**. Downloads are SHA256-verified, saved to `models/loras`, and added to the stack immediately with their thumbnail and trigger words. LoRAs you already have show **✓ Add** instead |
 | **Prompts** | Positive + negative CLIP Text Encode. The negative toggle switches between **encode** and **zero-out** (use zero-out for CFG-1 models: Flux, Z-Image Turbo, Krea 2 Turbo, H3) |
 | **Latent** | Width × height (or presets) → an empty latent **in the loaded model's native format**: 4ch/8 (SD1.5/SDXL), 16ch/8 (SD3/Flux.1/Z-Image/Krea 2/Qwen), 128ch/16 (Flux.2), a video latent (Wan…), or the audio+video latent for MiniMax H3 (`length` = frames) |
-| **Grok prompt builder** | Type a rough idea, pick a style, and press **✨ Generate**. Or turn on `grok_auto` so a prompt is written on every queue |
+| **Grok prompt builder** | **Prompt model buttons**: Krea 2 · MiniMax H3 · Flux · Z-Image, plus a variant row (Turbo/Raw, video+audio/brief, Flux.2/Klein/Flux.1/Krea, Turbo/Base). The node recolors to match. **🔞 NSFW / SFW toggle** for adult (21+) prompts. Type a rough idea and press **✨ Generate**, or turn on `grok_auto` |
 
 Outputs: `MODEL, CLIP, VAE, positive, negative, LATENT, width, height, positive_text, negative_text, audio_vae`.
 
@@ -32,7 +33,8 @@ Click **🔑 API keys** on the node, paste your xAI key from [console.x.ai](http
 - **`grok_effort`:** reasoning effort. Each model only receives values it supports (`none` becomes `low` on 4.5–4.7).
 - **`grok_detail`:** how far Grok expands your idea, from `minimal` (polish only) to `detailed`.
 - **`grok_instructions`:** extra notes for Grok, e.g. "moody, 35mm film".
-- **`grok_seed` + `grok_auto`:** auto results are cached per idea/seed. Change the seed, or set its control to randomize, to get a new variation on every run.
+- **`grok_seed` + `grok_auto`:** auto results are cached per idea/seed (in memory and on disk, so reloading a workflow doesn't pay for the same prompt twice). Change the seed, or set its control to randomize, to get a new variation on every run. In auto mode your positive box is ignored; the status line under the node shows **📋 use Grok prompt**, which copies that prompt into the box and switches to manual.
+- **🔞 NSFW / SFW:** NSFW tells Grok to write explicit adult prompts. Everyone depicted is 21+, and minors or real, identifiable people are always refused. SFW keeps prompts non-explicit.
 - **`grok_image`** (optional input): Grok looks at a reference image (vision) in auto mode.
 - **`append_lora_triggers`:** adds the enabled LoRAs' Civitai trigger words. They are passed to Grok so it can weave them in, or appended to your manual prompt.
 
@@ -57,7 +59,7 @@ For Civitai, the node looks the file up through `GET /api/v1/model-versions/by-h
 - If that misses, it computes a full SHA256 once and caches it.
 - It also reuses info from rgthree, LoRA-Manager and Civitai-Helper sidecar files.
 
-Results and thumbnails are cached in `user/__dope_aio/`. Thumbnails above your chosen rating are blurred; set the ceiling under **Settings → DOPE AIO**. Only `image.civitai.com` URLs are ever downloaded. A Civitai key is optional; you only need one for gated models.
+Results and thumbnails are cached in `user/__dope_aio/`. If Civitai is unreachable, the failure is remembered for 10 minutes, so your UI never stalls. Thumbnails above your chosen rating are blurred; set the ceiling under **Settings → DOPE AIO**. Only `image.civitai.com` URLs are ever downloaded. A Civitai key (🔑 on the node) is optional. Some downloads need it, and it applies your Civitai NSFW browsing settings to searches.
 
 ## Recipes
 

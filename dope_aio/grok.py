@@ -84,17 +84,29 @@ def _raise_for_error(r):
 
 
 def _request(method, path, api_key, body=None, timeout=300, retries=3):
+    """GETs retry on any network error. POSTs (billed generations) are only re-sent when the
+    request provably never reached xAI (connect timeout / refused) or on 429/502/503/504 —
+    never after a read timeout, which could mean xAI already did (and billed) the work."""
     url = f"{BASE_URL}{path}"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    is_post = method.upper() == "POST"
     for attempt in range(retries + 1):
         try:
-            r = requests.request(method, url, headers=headers, json=body, timeout=timeout)
-        except (requests.ConnectionError, requests.Timeout) as e:
+            r = requests.request(method, url, headers=headers, json=body, timeout=(10, timeout))
+        except requests.ConnectTimeout as e:
             if attempt >= retries:
+                raise GrokError(0, "network", f"could not connect to api.x.ai: {e}")
+            time.sleep(min(20, 2 ** attempt) + random.random())
+            continue
+        except requests.ReadTimeout as e:
+            raise GrokError(0, "timeout", f"xAI did not answer within {timeout}s — try a lower reasoning effort ({e})")
+        except requests.ConnectionError as e:
+            if is_post or attempt >= retries:
                 raise GrokError(0, "network", str(e))
             time.sleep(min(20, 2 ** attempt) + random.random())
             continue
-        if r.status_code == 429 or r.status_code >= 500:
+        retryable = r.status_code == 429 or (r.status_code in (502, 503, 504) if is_post else r.status_code >= 500)
+        if retryable:
             if attempt >= retries:
                 _raise_for_error(r)
             ra = r.headers.get("retry-after", "")
@@ -212,10 +224,18 @@ def image_to_data_url(image, max_side=1536):
 
 
 # ------------------------------------------------------------------ generation
-def _parse_pair(text):
+def _split_marker(pos, neg):
+    # zimage.md's few-shot format; Grok sometimes puts it inside the JSON positive
+    if "---NEGATIVE---" in pos:
+        pos, tail = pos.split("---NEGATIVE---", 1)
+        neg = neg or tail
+    return pos.strip(), neg.strip()
+
+
+def _parse_pair(text, refusal=""):
     text = (text or "").strip()
     if not text:
-        raise GrokError(200, "empty", "Grok returned an empty response")
+        raise GrokError(200, "refused" if refusal else "empty", refusal or "Grok returned an empty response")
     candidates = [text]
     m = re.search(r"\{.*\}", text, re.S)
     if m:
@@ -223,14 +243,16 @@ def _parse_pair(text):
     for c in candidates:
         try:
             j = json.loads(c)
-            if isinstance(j, dict) and "positive" in j:
-                return str(j.get("positive") or "").strip(), str(j.get("negative") or "").strip()
         except ValueError:
-            pass
-    if "---NEGATIVE---" in text:
-        pos, neg = text.split("---NEGATIVE---", 1)
-        return pos.strip(), neg.strip()
-    return text, ""
+            continue
+        if isinstance(j, dict) and "positive" in j:
+            pos, neg = _split_marker(str(j.get("positive") or ""), str(j.get("negative") or ""))
+            if not pos:
+                raise GrokError(200, "refused", refusal or "Grok declined this idea (empty prompt returned) — rephrase it")
+            return pos, neg
+    if text.startswith("{"):
+        raise GrokError(200, "bad-json", "Grok returned malformed JSON: " + text[:200])
+    return _split_marker(text, "")
 
 
 def _call_responses(key, model, system, user_content, effort, temperature, cache_key, timeout):
@@ -246,12 +268,19 @@ def _call_responses(key, model, system, user_content, effort, temperature, cache
     if temperature is not None:
         body["temperature"] = temperature
     j = _request("POST", "/responses", key, body, timeout=timeout)
-    texts = [c.get("text", "")
-             for item in j.get("output", []) if item.get("type") == "message"
-             for c in item.get("content", []) if c.get("type") == "output_text"]
-    if not texts and j.get("status") == "incomplete":
-        raise GrokError(200, "incomplete", json.dumps(j.get("incomplete_details")))
-    return "".join(texts), j.get("usage") or {}
+    texts, refusals = [], []
+    for item in j.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for c in item.get("content", []):
+            if c.get("type") == "output_text":
+                texts.append(c.get("text", ""))
+            elif c.get("type") == "refusal":
+                refusals.append(c.get("refusal") or c.get("text") or "")
+    if j.get("status") not in (None, "completed"):
+        raise GrokError(200, j.get("status") or "incomplete",
+                        f"Grok stopped early: {json.dumps(j.get('incomplete_details'))}")
+    return "".join(texts), j.get("usage") or {}, " ".join(r for r in refusals if r)
 
 
 def _call_chat(key, model, system, user_content, effort, temperature, cache_key, timeout, seed):
@@ -277,12 +306,16 @@ def _call_chat(key, model, system, user_content, effort, temperature, cache_key,
     if seed is not None:
         body["seed"] = int(seed) & 0x7FFFFFFF
     j = _request("POST", "/chat/completions", key, body, timeout=timeout)
-    return (j["choices"][0]["message"].get("content") or ""), j.get("usage") or {}
+    choice = j["choices"][0]
+    if choice.get("finish_reason") not in (None, "stop", "end_turn"):
+        raise GrokError(200, "incomplete", f"Grok stopped early (finish_reason={choice.get('finish_reason')})")
+    msg = choice.get("message") or {}
+    return (msg.get("content") or ""), j.get("usage") or {}, (msg.get("refusal") or "")
 
 
 def generate(idea, style, model=DEFAULT_MODEL, effort="low", want_negative=True, image=None,
              temperature=None, extra_instructions="", seed=None, lora_triggers=None, width=1024, height=1024,
-             length=124, detail="standard", timeout=300):
+             length=124, detail="standard", timeout=300, nsfw=True):
     """Returns dict(positive, negative, model, style, cost_usd)."""
     key = require_key()
     st = get_style(style)
@@ -293,7 +326,7 @@ def generate(idea, style, model=DEFAULT_MODEL, effort="low", want_negative=True,
     eff = resolve_effort(model, effort)
     user_text = build_user_message(st, idea, want_negative=want_negative, extra=extra_instructions,
                                    has_image=image is not None, lora_triggers=lora_triggers, seed=seed,
-                                   width=width, height=height, length=length, detail=detail)
+                                   width=width, height=height, length=length, detail=detail, nsfw=nsfw)
     user_content = user_text
     if image is not None:
         data_url = image if isinstance(image, str) else image_to_data_url(image)
@@ -301,19 +334,20 @@ def generate(idea, style, model=DEFAULT_MODEL, effort="low", want_negative=True,
                         {"type": "input_text", "text": user_text}]
     cache_key = f"dope-aio-{st['key']}"
     try:
-        text, usage = _call_responses(key, model, st["system"], user_content, eff, temperature, cache_key, timeout)
+        text, usage, refusal = _call_responses(key, model, st["system"], user_content, eff, temperature, cache_key, timeout)
     except GrokError as e:
-        # 404/405: endpoint unavailable; 400/422 about an unsupported param: retry on the
-        # legacy chat endpoint without temperature
-        msg = str(e.message).lower()
-        param_issue = any(s in msg for s in ("not supported", "unsupported", "unknown", "unrecognized",
-                                             "json_schema", "temperature", "reasoning", "prompt_cache_key"))
-        if e.status in (404, 405) or (e.status in (400, 422) and param_issue and "api key" not in msg):
-            log.warning("DopeAIO: /responses failed (%s); retrying with /chat/completions", e)
-            text, usage = _call_chat(key, model, st["system"], user_content, eff, None, cache_key, timeout, seed)
-        else:
+        # Only when the Responses *endpoint* itself is unavailable (405, or a 404 that isn't
+        # xAI's "model does not exist") fall back to legacy /chat/completions.
+        if not (e.status == 405 or (e.status == 404 and "model" not in str(e.message).lower())):
             raise
-    positive, negative = _parse_pair(text)
+        log.warning("DopeAIO: /responses unavailable (%s); retrying with /chat/completions", e)
+        try:
+            text, usage, refusal = _call_chat(key, model, st["system"], user_content, eff, None, cache_key, timeout, seed)
+        except GrokError:
+            raise e
+    positive, negative = _parse_pair(text, refusal)
+    if st["key"].startswith("h3"):  # local H3 tokenizer's control token is <|cutoff|>
+        positive = positive.replace("<cutoff>", "<|cutoff|>")
     if not want_negative or not st.get("uses_negative", False):
         negative = ""
     ticks = usage.get("cost_in_usd_ticks")

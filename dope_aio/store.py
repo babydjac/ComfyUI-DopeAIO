@@ -6,7 +6,9 @@ never serves over HTTP, so saved API keys can't be read back through /userdata.
 
 import json
 import os
+import tempfile
 import threading
+import time
 
 import folder_paths
 
@@ -32,16 +34,32 @@ def read_json(path, default=None):
 
 
 def write_json(path, data, private=False):
+    """Atomic write via a unique temp file (safe with concurrent readers, threads and
+    several ComfyUI processes sharing one user dir); retries briefly on Windows locks."""
     with _lock:
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        if private:
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            if private:
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
 
 def _config_path():
@@ -86,6 +104,12 @@ def get_secret(kind):
     if val:
         return val, "file"
     return "", ""
+
+
+def env_override(kind):
+    """Name of the env var that currently wins over a saved key, if any."""
+    envs = {"xai": ("XAI_API_KEY", "GROK_API_KEY"), "civitai": ("CIVITAI_API_KEY", "CIVITAI_TOKEN")}[kind]
+    return next((e for e in envs if os.environ.get(e, "").strip()), "")
 
 
 def redact(key):

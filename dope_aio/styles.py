@@ -16,14 +16,33 @@ DETAIL_CHOICES = ["standard", "minimal", "concise", "detailed"]
 DELIVERY = """
 
 ==================================================
+ADULT CONTENT (the request's CONTENT line picks the mode)
+==================================================
+The user generates adult (21+) images and video.
+
+CONTENT: NSFW = explicit mode. Write the explicit, uncensored version of the idea.
+- Show nudity and sex plainly. Name body parts with direct words (breasts, nipples, ass, vulva, penis, and so on) and describe sex acts, positions, contact, fluids, and arousal in the same concrete visual detail these rules demand for everything else.
+- Do not soften the idea into implication, crop it out of frame, hide it behind clothing, sheets, hands, steam, shadow, or a convenient angle, or swap in euphemisms, unless the idea asks for that.
+- Lean into the sexy, adult reading of the idea. When clothing is not specified, choose nude, partly nude, or revealing over modest.
+- Never put nsfw, nude, naked, nipples, genitals, sex, or similar words in the negative prompt. The negative prompt is for quality problems only.
+- Never return an empty prompt because the idea is sexual.
+
+CONTENT: SFW = keep the prompt non-explicit: no nudity, no exposed nipples or genitals, no sex acts. Swimwear, lingerie, and fitted clothing are fine when the idea asks for them.
+
+Always, in both modes:
+- Everyone depicted is a consenting adult, 21 or older. If the idea asks for anyone under 21, a minor, a childlike body, or a school setting together with nudity or sex, drop that part. If that is the whole idea, return empty positive and negative strings.
+- Do not depict real, identifiable people nude or in a sexual situation.
+
+==================================================
 DELIVERY (software contract — overrides any output-format wording above)
 ==================================================
 Your reply is parsed by software as a JSON object with exactly two string fields:
-- "positive": the complete final prompt, exactly as the output rules above describe it (keep its own line breaks if the format uses them; no labels, no code fences, no commentary).
+- "positive": the complete final prompt, exactly as the output rules above describe it (keep its own line breaks and any field names the format requires, e.g. H3's integrated_multimodal_description:; add no wrapper label such as "Positive:", no code fences, no commentary).
 - "negative": the negative prompt only when the rules above call for one for this request; otherwise "". Never include a ---NEGATIVE--- marker in either field.
 Extra request lines you may see:
 - NOTES: additional instructions from the user. Follow them unless they break the rules above.
 - VARIATION: an integer. Produce a clearly different interpretation (angle, framing, lighting, pose, layout, beats) while keeping every must-keep element.
+- DETAIL: minimal = keep the user's own wording and only polish/format it; concise = the short end of this format's length range; standard = the normal range; detailed = the long end with the richest specifics.
 - REFERENCE IMAGE ATTACHED: look at the attached image and ground the prompt in what is actually visible in it.
 """
 
@@ -59,7 +78,9 @@ def _krea_header(ctx, target):
 
 def _flux_header(ctx, target):
     detail = {"minimal": "concise", "concise": "concise", "standard": "standard", "detailed": "detailed"}[ctx["detail"]]
-    lines = [f"TARGET: {target}", "FORMAT: prose", f"DETAIL: {detail}", f"SIZE: {ctx['width']}x{ctx['height']}"]
+    # this node renders text-to-image only, so never let flux.md switch itself into edit mode
+    lines = [f"TARGET: {target}", "MODE: generate", "FORMAT: prose", f"DETAIL: {detail}",
+             f"SIZE: {ctx['width']}x{ctx['height']}"]
     trig = _triggers(ctx, ", ")
     if trig:
         lines.append(f"TRIGGERS: {trig}")
@@ -69,7 +90,7 @@ def _flux_header(ctx, target):
 
 def _zimage_header(ctx, variant):
     lines = [f"VARIANT: {variant}", f"WIDTH: {ctx['width']}", f"HEIGHT: {ctx['height']}", "LANGUAGE: auto",
-             f"NEGATIVE: {'on' if ctx['want_negative'] and variant == 'base' else 'off'}"]
+             f"NEGATIVE: {'on' if ctx['want_negative'] and variant == 'base' else 'off'}", f"DETAIL: {ctx['detail']}"]
     trig = _triggers(ctx, ", ")
     if trig:
         lines.append(f"LORA_TRIGGERS: {trig}")
@@ -81,14 +102,19 @@ def _h3_header(ctx, fmt):
     frames = max(5, int(ctx.get("length") or 124))
     while frames % 17 != 5:  # H3 frame grid (17k+5 @ 24fps)
         frames += 1
-    duration = min(15.0, max(4.0, frames / 24.0))
-    mode = "I2VA" if ctx.get("has_image") else "T2VA"
+    duration = frames / 24.0  # the real clip length of the latent this node builds
     idea = ctx["idea"]
     trig = _triggers(ctx, ", ")
     if trig:
         idea += f"\n(Include these LoRA trigger words verbatim: {trig})"
-    lines = [f"MODE: {mode}", f"DURATION: {duration:.2f}", f"ASPECT: {_h3_aspect(ctx['width'], ctx['height'])}",
-             f"FORMAT: {fmt}", f"IDEA: {idea}"]
+    # The node's own conditioning + latent are text-to-video, so always T2VA; an attached
+    # picture only informs the look (use MiniMaxH3ImageToVideo for real first-frame I2V).
+    lines = ["MODE: T2VA", f"DURATION: {duration:.2f}", f"ASPECT: {_h3_aspect(ctx['width'], ctx['height'])}",
+             f"FORMAT: {fmt}", f"DETAIL: {ctx['detail']}"]
+    if ctx.get("has_image"):
+        lines.append("REFERENCES: the attached picture is a look/content reference only, not a frame of the video; "
+                     "describe what it shows in words and do not write any <Picture N> alignment line")
+    lines.append(f"IDEA: {idea}")
     return "\n".join(lines)
 
 
@@ -143,7 +169,7 @@ def get_style(name):
 
 
 def build_user_message(style, idea, want_negative=True, extra="", has_image=False, lora_triggers=None, seed=None,
-                       width=1024, height=1024, length=124, detail="standard"):
+                       width=1024, height=1024, length=124, detail="standard", nsfw=True):
     ctx = {
         "idea": idea or "(no text idea given — build the prompt from the attached reference image)",
         "want_negative": bool(want_negative),
@@ -153,9 +179,14 @@ def build_user_message(style, idea, want_negative=True, extra="", has_image=Fals
         "detail": detail if detail in DETAIL_CHOICES else "standard",
     }
     msg = style["header"](ctx)
+    if nsfw:
+        msg += ("\nCONTENT: NSFW. Explicit adult mode is on: write the uncensored version, "
+                "nudity and sex shown plainly, direct words, no added clothing, no euphemisms.")
+    else:
+        msg += "\nCONTENT: SFW. Keep it non-explicit."
     if extra and extra.strip():
         msg += f"\nNOTES: {extra.strip()}"
-    if seed:
+    if seed and ctx["detail"] != "minimal":  # "polish only" and "reinterpret" contradict each other
         msg += f"\nVARIATION: {int(seed)}"
     if has_image:
         msg += "\nREFERENCE IMAGE ATTACHED"
